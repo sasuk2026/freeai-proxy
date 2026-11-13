@@ -96,9 +96,11 @@ async function selftest() {
       }
     };
     await Promise.all([worker(), worker()]);
-    AVAILABLE = POOL.filter(c => !c.dead && c.lastOk > 0).sort((a, b) => b.lastOk - a.lastOk);
+    // 活着(未被永久废除)的都进可调用列表；本次真回过话的排前面。
+    // 临时限流(402/429/超时)不废除——否则一刷新就空列表，且额度恢复后找不回来。
+    AVAILABLE = POOL.filter(c => !c.dead).sort((a, b) => b.lastOk - a.lastOk);
     LAST_TEST = Date.now();
-    console.log('[selftest] ok=' + AVAILABLE.length + ' dead=' + POOL.filter(c => c.dead).length + ' [' + AVAILABLE.map(a => a.id).join(',') + ']');
+    console.log('[selftest] listed=' + AVAILABLE.length + ' confirmedOk=' + AVAILABLE.filter(c => c.lastOk > 0).length + ' dead=' + POOL.filter(c => c.dead).length);
   } finally { TESTING = false; }
   return AVAILABLE;
 }
