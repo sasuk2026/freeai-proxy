@@ -2,7 +2,7 @@ import http from 'node:http';
 
 const PAT = process.env.GITHUB_PAT || '';
 const PORT = Number(process.env.PORT || 10000);
-const TIMEOUT = Number(process.env.UPSTREAM_TIMEOUT || 20000);
+const TIMEOUT = Number(process.env.UPSTREAM_TIMEOUT || 25000);
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -11,26 +11,28 @@ const CORS = {
   'Access-Control-Max-Age': '86400',
 };
 
-// 免费上游候选：GitHub Models(用你的 PAT) + Pollinations(免 Key)
-const GHM = [
-  'openai/gpt-4o-mini','openai/gpt-4o','openai/gpt-4.1-mini','openai/gpt-4.1',
-  'openai/o3-mini','openai/o4-mini','meta/Llama-3.3-70B-Instruct',
-  'mistral-ai/Mistral-small','deepseek/DeepSeek-R1','microsoft/Phi-4',
-  'google/gemma-3-27b-it','xai/grok-3-mini',
+// 候选上游。实测：pollinations 匿名可用的是 openai-fast 系列(gpt-oss-20b)；
+// 多数名字是同一免费额度的别名/受限，402=临时限流(不废除、可 failover)，404=真不存在(废除)。
+const POLL_EP = 'https://text.pollinations.ai/openai';
+const POLL_MODELS = [
+  'openai-fast', 'gpt-oss-20b', 'openai', 'gpt-oss', 'ovh-reasoning',
+  'mistral', 'llama', 'qwen-coder', 'deepseek', 'gemini', 'phi',
 ];
-const POL = ['openai','openai-large','mistral','llama','qwen-coder','deepseek','gemini'];
+const GHM_MODELS = ['openai/gpt-4o-mini', 'openai/gpt-4.1-mini', 'microsoft/Phi-4'];
 
-const CANDIDATES = [];
-for (const m of GHM) CANDIDATES.push({
+let POOL = [];          // 全部候选（含被限流但有效的）
+for (const m of POLL_MODELS) POOL.push({
+  id: (m === 'gpt-oss-20b' ? 'gpt-oss-20b' : m), provider: 'pollinations',
+  upstreamModel: m, endpoint: POLL_EP, bearer: '',
+  dead: false, lastOk: 0, lastFailWhy: '',
+});
+if (PAT) for (const m of GHM_MODELS) POOL.push({
   id: m, provider: 'github-models', upstreamModel: m,
   endpoint: 'https://models.github.ai/inference/chat/completions', bearer: PAT,
-});
-for (const m of POL) CANDIDATES.push({
-  id: m, provider: 'pollinations', upstreamModel: m,
-  endpoint: 'https://text.pollinations.ai/openai', bearer: '',
+  dead: false, lastOk: 0, lastFailWhy: '',
 });
 
-let AVAILABLE = [];
+let AVAILABLE = [];     // 最近一次体检真回过话的（用于 /v1/models 展示）
 let LAST_TEST = 0;
 let TESTING = false;
 
@@ -45,68 +47,76 @@ function readBody(req) {
     req.on('end', () => { try { resolve(JSON.parse(b || '{}')); } catch { resolve({}); } });
   });
 }
-async function mapLimit(items, limit, fn) {
-  const out = []; let i = 0;
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
-    while (i < items.length) { const idx = i++; out[idx] = await fn(items[idx]); }
-  }));
-  return out;
+// 404/401/403/非JSON = 永久失效(废除)；402/429/5xx/超时 = 临时(保留，仅跳过)
+function isPermanent(status, txt) {
+  if (status === 404 || status === 401 || status === 403) return true;
+  if (/NOT_FOUND|invalid.*model|unknown model/i.test(txt || '')) return true;
+  return false;
 }
-async function testOne(c) {
+async function callUpstream(c, messages, maxTokens) {
   const headers = { 'Content-Type': 'application/json' };
   if (c.bearer) headers['Authorization'] = 'Bearer ' + c.bearer;
   const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), TIMEOUT);
   try {
     const r = await fetch(c.endpoint, {
       method: 'POST', headers,
-      body: JSON.stringify({
-        model: c.upstreamModel,
-        messages: [{ role: 'user', content: 'Reply with exactly: OK' }],
-        max_tokens: 16, stream: false,
-      }),
+      body: JSON.stringify({ model: c.upstreamModel, messages, max_tokens: maxTokens || 16, stream: false }),
       signal: ctl.signal,
     });
     clearTimeout(t);
     const txt = await r.text();
-    if (!r.ok) return { id: c.id, ok: false, why: 'HTTP ' + r.status + ' ' + txt.slice(0, 70) };
-    let d; try { d = JSON.parse(txt); } catch { return { id: c.id, ok: false, why: 'non-json: ' + txt.slice(0, 50) }; }
+    if (!r.ok) return { ok: false, status: r.status, why: 'HTTP ' + r.status + ' ' + txt.slice(0, 80), permanent: isPermanent(r.status, txt) };
+    let d; try { d = JSON.parse(txt); } catch { return { ok: false, status: 502, why: 'non-json: ' + txt.slice(0, 50), permanent: false }; }
     const content = d?.choices?.[0]?.message?.content ?? d?.choices?.[0]?.text;
-    if (!content || !String(content).trim()) return { id: c.id, ok: false, why: 'empty content' };
-    return { id: c.id, ok: true, c, sample: String(content).trim().slice(0, 30) };
+    if (!content || !String(content).trim()) return { ok: false, status: 502, why: 'empty content', permanent: false };
+    return { ok: true, data: d, content: String(content) };
   } catch (e) {
     clearTimeout(t);
-    return { id: c.id, ok: false, why: String(e.message || e).slice(0, 70) };
+    return { ok: false, status: 504, why: String(e.message || e).slice(0, 60), permanent: false };
   }
 }
+// 低并发体检（2 路），避免把上游打到限流
 async function selftest() {
   if (TESTING) return AVAILABLE;
   TESTING = true;
+  const fresh = [];
   try {
-    const rs = await mapLimit(CANDIDATES, 5, testOne);
-    AVAILABLE = rs.filter(x => x.ok).map(x => ({
-      id: x.id, provider: x.c.provider, upstreamModel: x.c.upstreamModel,
-      endpoint: x.c.endpoint, bearer: x.c.bearer, sample: x.sample,
-    }));
+    const alive = POOL.filter(c => !c.dead);
+    let idx = 0;
+    const worker = async () => {
+      while (idx < alive.length) {
+        const c = alive[idx++];
+        const r = await callUpstream(c, [{ role: 'user', content: 'Reply with exactly: OK' }], 8);
+        if (r.ok) { c.lastOk = Date.now(); c.lastFailWhy = ''; fresh.push(c); }
+        else {
+          c.lastFailWhy = r.why;
+          if (r.permanent) { c.dead = true; console.log('[abolish] ' + c.id + ' -> ' + r.why); }
+          else console.log('[temp-skip] ' + c.id + ' -> ' + r.why);
+        }
+      }
+    };
+    await Promise.all([worker(), worker()]);
+    AVAILABLE = POOL.filter(c => !c.dead && c.lastOk > 0).sort((a, b) => b.lastOk - a.lastOk);
     LAST_TEST = Date.now();
-    console.log('[selftest] available ' + AVAILABLE.length + '/' + CANDIDATES.length, AVAILABLE.map(a => a.id).join(','));
-    if (!AVAILABLE.length) console.log('[selftest] fails', rs.filter(x => !x.ok).slice(0, 8).map(x => x.id + ':' + x.why));
+    console.log('[selftest] ok=' + AVAILABLE.length + ' dead=' + POOL.filter(c => c.dead).length + ' [' + AVAILABLE.map(a => a.id).join(',') + ']');
   } finally { TESTING = false; }
   return AVAILABLE;
 }
-function drop(id) { AVAILABLE = AVAILABLE.filter(a => a.id !== id); }
+function abolish(c) { c.dead = true; AVAILABLE = AVAILABLE.filter(a => a.id !== c.id); }
 
 const server = http.createServer(async (req, res) => {
   let u; try { u = new URL(req.url, 'http://x'); } catch { return jsonRes(res, 400, { error: 'bad url' }); }
   if (req.method === 'OPTIONS') { res.writeHead(204, CORS); res.end(); return; }
 
   if (u.pathname === '/healthz')
-    return jsonRes(res, 200, { ok: true, available: AVAILABLE.length, lastTest: LAST_TEST });
+    return jsonRes(res, 200, { ok: true, available: AVAILABLE.length, dead: POOL.filter(c => c.dead).length, lastTest: LAST_TEST });
 
   if (u.pathname === '/v1/selftest') {
     await selftest();
     return jsonRes(res, 200, {
       count: AVAILABLE.length,
-      available: AVAILABLE.map(a => ({ id: a.id, provider: a.provider, sample: a.sample })),
+      abolished: POOL.filter(c => c.dead).map(c => c.id),
+      available: AVAILABLE.map(a => ({ id: a.id, provider: a.provider })),
     });
   }
 
@@ -123,45 +133,43 @@ const server = http.createServer(async (req, res) => {
 
   if (u.pathname === '/v1/chat/completions' && req.method === 'POST') {
     const body = await readBody(req);
-    let item = AVAILABLE.find(a => a.id === body.model);
-    if (!item) { await selftest(); item = AVAILABLE.find(a => a.id === body.model) || AVAILABLE[0]; }
-    if (!item) return jsonRes(res, 503, {
-      error: { message: '当前没有可用上游（自动测活全部未通过），点 /v1/selftest 查看详情', type: 'server_error', code: 'no_upstream' },
-    });
-
-    // 调用层鉴权：只放行 sk- 开头的 Key（PAT 只在服务端，不下发前端）
     const auth = req.headers.authorization || '';
     if (!/^Bearer\s+sk-\S{6,}/i.test(auth))
       return jsonRes(res, 401, { error: { message: '需要 API Key：Authorization: Bearer sk-...', code: 'auth_required' } });
 
-    const headers = { 'Content-Type': 'application/json' };
-    if (item.bearer) headers['Authorization'] = 'Bearer ' + item.bearer;
-    const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), TIMEOUT + 10000);
-    try {
-      const up = await fetch(item.endpoint, {
-        method: 'POST', headers,
-        body: JSON.stringify({ ...body, model: item.upstreamModel, stream: false }),
-        signal: ctl.signal,
-      });
-      clearTimeout(t);
-      const txt = await up.text();
-      if (!up.ok) { drop(item.id); return jsonRes(res, up.status, { error: { message: '上游不可用，已把该模型从可用列表废除：' + txt.slice(0, 90), type: 'upstream_error' } }); }
-      let d; try { d = JSON.parse(txt); } catch { drop(item.id); return jsonRes(res, 502, { error: { message: '上游返回非 JSON，已废除该模型', type: 'upstream_error' } }); }
-      const content = d?.choices?.[0]?.message?.content ?? d?.choices?.[0]?.text;
-      if (!content || !String(content).trim()) { drop(item.id); return jsonRes(res, 502, { error: { message: '上游无回话内容，已废除该模型', type: 'upstream_error' } }); }
+    const messages = body.messages || [{ role: 'user', content: 'hi' }];
+    const maxTokens = body.max_tokens || 512;
+    // 顺序：用户指定模型优先 → 其余活着的候选（限流自动 failover）
+    let order = POOL.filter(c => !c.dead);
+    const wanted = order.find(c => c.id === body.model);
+    if (wanted) order = [wanted, ...order.filter(c => c !== wanted)];
 
-      if (body.stream) {
-        res.writeHead(200, { ...CORS, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
-        const base = { id: 'chatcmpl-' + Date.now(), object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: body.model };
-        res.write('data: ' + JSON.stringify({ ...base, choices: [{ index: 0, delta: { role: 'assistant', content: String(content) }, finish_reason: null }] }) + '\n\n');
-        res.write('data: ' + JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\n');
-        res.write('data: [DONE]\n\n'); res.end(); return;
+    let lastErr = null;
+    for (const c of order) {
+      const r = await callUpstream(c, messages, maxTokens);
+      if (r.ok) {
+        c.lastOk = Date.now(); c.lastFailWhy = '';
+        const d = r.data;
+        if (body.stream) {
+          res.writeHead(200, { ...CORS, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache' });
+          const base = { id: 'chatcmpl-' + Date.now(), object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000), model: body.model || c.id };
+          res.write('data: ' + JSON.stringify({ ...base, choices: [{ index: 0, delta: { role: 'assistant', content: r.content }, finish_reason: null }] }) + '\n\n');
+          res.write('data: ' + JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\n');
+          res.write('data: [DONE]\n\n'); res.end(); return;
+        }
+        return jsonRes(res, 200, d);
       }
-      return jsonRes(res, 200, d);
-    } catch (e) {
-      clearTimeout(t); drop(item.id);
-      return jsonRes(res, 502, { error: { message: '上游调用失败，已废除该模型：' + String(e.message || e), type: 'upstream_error' } });
+      lastErr = r;
+      c.lastFailWhy = r.why;
+      if (r.permanent) abolish(c);   // 真不存在/失效 → 当场废除，不再进任何调用
+      // 临时限流/超时 → 保留，继续试下一个
     }
+    return jsonRes(res, lastErr?.status || 503, {
+      error: {
+        message: '所有可用通道这次都没回话（多为免费额度临时限流，稍等会自动恢复）。最后错误：' + (lastErr?.why || 'unknown'),
+        type: 'upstream_error', code: 'all_failed',
+      },
+    });
   }
 
   jsonRes(res, 200, { name: 'freeai-proxy', available: AVAILABLE.length, endpoints: ['/healthz', '/v1/models', '/v1/chat/completions', '/v1/selftest'] });
