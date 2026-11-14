@@ -82,8 +82,9 @@ const POOL = DEFS.map(d => ({
   dead: false, lastOk: 0, lastFailWhy: '',
 }));
 
-const channelOff = {};            // 通道级熔断：占位/不可达时整批跳过，不逐个超时
-let LAST_TEST = 0, TESTING = false;
+const channelOff = {};            // 通道级暂避：占位/不可达时短暂停用，到点自动复活
+const CHANNEL_COOL = 30000;       // 30 秒后自动复活重新参与轮转，不做一锤子打死
+let LAST_TEST = 0, TESTING = false, RR = 0;   // RR：全局轮转指针，把额度均匀摊到所有槽位
 const alive = () => POOL.filter(c => !c.dead);
 const confirmed = () => alive().filter(c => c.lastOk > 0).sort((a, b) => b.lastOk - a.lastOk);
 const oaiNow = () => Math.floor(Date.now() / 1000);
@@ -166,8 +167,8 @@ function classify(status, txt, content) {
 async function callUpstream(c, messages, maxTokens, byokKey, timeout) {
   if (c.needsKey && !byokKey) return { kind: 'needs_key', why: '需要免费 Key' };
   if (channelOff[c.ch]) {
-    if (Date.now() - channelOff[c.ch] < 300000) return { kind: 'cooling', why: '通道暂不可用：' + c.ch };
-    delete channelOff[c.ch];   // 5 分钟后自动重试恢复
+    if (Date.now() - channelOff[c.ch] < CHANNEL_COOL) return { kind: 'cooling', why: '通道冷却中：' + c.ch };
+    delete channelOff[c.ch];   // 到点自动复活，重新进入无限轮转池
   }
   const { url, headers, body } = buildRequest(c, messages, maxTokens, byokKey);
   const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), timeout || TIMEOUT);
@@ -229,15 +230,35 @@ async function selftest(force) {
   return confirmed();
 }
 
-// 旗舰优先：同级别里「真回过话」的排前面；BYOK 无 Key 自动跳过；通道熔断自动跳过
-function pickOrder(wantedId, byokKey) {
-  const usable = alive().filter(c => !channelOff[c.ch] && (!c.needsKey || byokKey)).sort(byTier);
-  let order = usable.slice(0, 7);
-  if (wantedId) {
-    const w = usable.find(c => c.id === wantedId);
-    if (w) order = [w, ...order.filter(c => c !== w)].slice(0, 7);
+// 「无限额度池」：所有免费槽位 + BYOK模型×每个Key 展开成独立槽位。
+// 每家公益上游都有限额，但把额度摊到几十个槽位上、全局轮转、限流自动跳、冷却自动复活，
+// 单次请求一路重试到真回话为止 —— 用户侧感知就是「打不完」。
+function buildSlots(keys) {
+  const slots = [];
+  for (const c of alive()) {
+    // 冷却通道的槽位仍留在池里（排后面），轮到时由 callUpstream 判断到点自动复活 —— 否则永远没机会恢复
+    if (c.needsKey) {
+      for (const k of keys) slots.push({ c, key: k, id: c.id });
+    } else slots.push({ c, key: '', id: c.id });
   }
-  return order;
+  slots.sort((a, b) => {
+    const off = (channelOff[a.c.ch] ? 1 : 0) - (channelOff[b.c.ch] ? 1 : 0);
+    return off || byTier(a.c, b.c) || ((b.c.lastOk > 0 ? 1 : 0) - (a.c.lastOk > 0 ? 1 : 0));
+  });
+  return slots;
+}
+function pickOrder(wantedId, keys) {
+  const slots = buildSlots(keys);
+  if (!slots.length) return [];
+  const n = slots.length, start = RR % n;
+  const rotated = [...slots.slice(start), ...slots.slice(0, start)];
+  RR = (start + 1) % n;                    // 每次请求前移一格，下次自动换下一个槽位摊额度
+  let order = rotated;
+  if (wantedId) {
+    const w = rotated.find(s => s.id === wantedId);
+    if (w) order = [w, ...rotated.filter(s => s !== w)];   // 指定模型优先，但失败后仍全池兜底
+  }
+  return order.slice(0, Math.min(order.length, 40));
 }
 function modelView(c) {
   return {
@@ -261,6 +282,8 @@ const server = http.createServer(async (req, res) => {
       dead: POOL.filter(c => c.dead).length,
       channels: [...new Set(alive().map(c => c.provider))],
       channelsOff: Object.keys(channelOff), githubToken: !!GH_TOKEN, lastTest: LAST_TEST,
+      poolSlots: alive().length, flagshipSlots: alive().filter(c => c.tier === 'flagship').length,
+      rr: RR, channelCoolMs: CHANNEL_COOL, mode: 'unlimited-pool',
     });
 
   if (u.pathname === '/v1/selftest') {
@@ -282,25 +305,28 @@ const server = http.createServer(async (req, res) => {
   }
 
   if (u.pathname === '/v1/chat/completions' && req.method === 'POST') {
-    // 免费档永远不校验 Key；BYOK 档用 X-Upstream-Key 透传，绝不静默降级到小模型代答
-    const byokKey = String(req.headers['x-upstream-key'] || '').trim();
+    // 免费档永远不校验 Key；Key 池（多个免费 Key 用逗号/换行分隔）让 BYOK 档线性扩容
+    const keys = String(req.headers['x-upstream-key'] || '').split(/[\s,;]+/).map(s => s.trim()).filter(Boolean);
     const body = await readBody(req);
     const messages = body.messages || [{ role: 'user', content: 'hi' }];
     const maxTokens = body.max_tokens || 512;
     const wanted = POOL.find(c => c.id === body.model);
-    if (wanted && wanted.needsKey && !byokKey && !wanted.dead) {
+    if (wanted && wanted.needsKey && !keys.length && !wanted.dead) {
       return jsonRes(res, 402, {
         error: {
-          message: '「' + wanted.label + '」属于高级 BYOK 档：请在控制台填入一个免费 Key（OpenRouter 或 api.airforce 免费注册，无需绑卡），请求头带 X-Upstream-Key 即可。不带 Key 的免费模型现在就能直接调用。',
+          message: '「' + wanted.label + '」属于高级 BYOK 档：请在控制台填入免费 Key（OpenRouter 或 api.airforce 免费注册，无需绑卡），请求头 X-Upstream-Key 可填多个，网关会自动轮转摊额度。不带 Key 的免费模型现在就能直接调用。',
           type: 'needs_key', code: 'upstream_key_required', model: wanted.id,
         },
       });
     }
 
-    const order = pickOrder(body.model, byokKey || undefined);
+    const order = pickOrder(body.model, keys);
+    const deadline = Date.now() + 80000;      // 单次请求最多遍历 80 秒，避免挂死
     let lastWhy = 'unknown';
-    for (const c of order) {
-      const r = await callUpstream(c, messages, maxTokens, byokKey || '', TIMEOUT);
+    for (const slot of order) {
+      if (Date.now() > deadline) break;
+      const c = slot.c;
+      const r = await callUpstream(c, messages, maxTokens, slot.key, TIMEOUT);
       if (r.kind === 'ok') {
         c.lastOk = Date.now(); c.lastFailWhy = '';
         const extra = { 'X-FreeAI-Model': c.id, 'X-FreeAI-Provider': c.provider };
@@ -322,8 +348,9 @@ const server = http.createServer(async (req, res) => {
   }
 
   jsonRes(res, 200, {
-    name: 'freeai-proxy', version: '2.0', alive: alive().length, confirmed: confirmed().length,
-    flagship: alive().filter(c => c.tier === 'flagship').length,
+    name: 'freeai-proxy', version: '3.0-unlimited-pool', alive: alive().length, confirmed: confirmed().length,
+    poolSlots: alive().length, flagship: alive().filter(c => c.tier === 'flagship').length,
+    mode: '全局轮转 + 限流自动跳 + 30s 自动复活 + Key 池线性扩容',
     channels: [...new Set(POOL.map(c => c.provider))],
     endpoints: ['/healthz', '/v1/models', '/v1/chat/completions', '/v1/selftest'],
   });
