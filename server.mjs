@@ -5,10 +5,10 @@ const PORT = Number(process.env.PORT || 10000);
 const TIMEOUT = Number(process.env.UPSTREAM_TIMEOUT || 12000);      // 体检/单槽位硬超时
 const GH_TOKEN = process.env.GITHUB_PAT || '';
 // ── 低延迟竞速：一次请求同时打多家不同渠道，谁先真回话就用谁；绝不串行挨个等超时 ──
-const RACE_TIMEOUT = Number(process.env.RACE_TIMEOUT || 6500);       // 竞速单槽位最多 6.5 秒
+const RACE_TIMEOUT = Number(process.env.RACE_TIMEOUT || 7500);       // 竞速单槽位最多 7.5 秒（Cloudflare WS 常需 7~10s）
 const RACE_N = 4;                                                     // 每批 4 个不同渠道并发
-const RACE_BATCHES = 3;                                               // 3 批兜底，降低「全渠道限流」概率
-const REQ_DEADLINE_MS = Number(process.env.REQ_DEADLINE_MS || 15000); // 单次请求硬上限 15 秒
+const RACE_BATCHES = 4;                                               // 4 批兜底，降低「全渠道限流」概率
+const REQ_DEADLINE_MS = Number(process.env.REQ_DEADLINE_MS || 22000); // 单次请求硬上限 22 秒（流式首包秒发，不体感为转圈）
 
 // 放宽 CORS：第三方套壳 App 常带自定义头（X-Title / HTTP-Referer / x-stainless-* 等），
 // 预检被拒会直接 fetch reject，客户端把错误对象 String() 就显示成 [object Object]。
@@ -572,8 +572,12 @@ const server = http.createServer(async (req, res) => {
     const maxSlots = RACE_N * RACE_BATCHES;
     for (let i = 0; i < Math.min(raced.length, maxSlots) && !winner && Date.now() < deadline; i += RACE_N) {
       const batch = raced.slice(i, i + RACE_N);
+      // 只有「点名模型所在通道健康且最近真回过话」才给独占窗口；
+      // 已限流的通道（如偶发 429 的 llm7）不再白白等 0.9 秒，直接全池并发
+      const giveHead = i === 0 && reqModel && wantedSlot
+        && !channelOff[wantedSlot.c.ch] && wantedSlot.c.lastOk > 0;
       winner = await raceOnce(batch, messages, maxTokens, Math.min(RACE_TIMEOUT, deadline - Date.now()),
-        i === 0 && reqModel ? 900 : 0);
+        giveHead ? 900 : 0);
       if (!winner) lastWhy = '一批 ' + batch.length + ' 家渠道均限流/超时';
     }
     if (!winner) {
