@@ -2,8 +2,13 @@ import http from 'node:http';
 import crypto from 'node:crypto';
 
 const PORT = Number(process.env.PORT || 10000);
-const TIMEOUT = Number(process.env.UPSTREAM_TIMEOUT || 12000);
+const TIMEOUT = Number(process.env.UPSTREAM_TIMEOUT || 12000);      // 体检/单槽位硬超时
 const GH_TOKEN = process.env.GITHUB_PAT || '';
+// ── 低延迟竞速：一次请求同时打多家不同渠道，谁先真回话就用谁；绝不串行挨个等超时 ──
+const RACE_TIMEOUT = Number(process.env.RACE_TIMEOUT || 7000);       // 竞速单槽位最多 7 秒
+const RACE_N = 4;                                                     // 每批 4 个不同渠道并发
+const RACE_BATCHES = 3;                                               // 最多 3 批兜底
+const REQ_DEADLINE_MS = Number(process.env.REQ_DEADLINE_MS || 17000); // 单次请求硬上限 17 秒
 
 const CORS = {
   'Access-Control-Allow-Origin': '*',
@@ -194,7 +199,7 @@ function classify(status, txt, content) {
   return 'ok';
 }
 // Cloudflare Workers AI Playground：零凭证 WebSocket，每次新建独立 agent（天然摊额度）
-function callCloudflare(c, messages, maxTokens, timeout) {
+function callCloudflare(c, messages, maxTokens, timeout, signal) {
   return new Promise(resolve => {
     const agentId = 'playground-' + Math.random().toString(36).substring(2, 15);
     const pk = crypto.randomUUID();
@@ -212,6 +217,11 @@ function callCloudflare(c, messages, maxTokens, timeout) {
     };
     const timer = setTimeout(() => finish(out.trim() ? 'ok' : 'cooling', 'ws timeout'), timeout || 14000);
     try { ws = new WebSocket(url); } catch (e) { return finish('cooling', String(e)); }
+    // 竞速输了就被中止：立刻关掉 WS，不继续占用免费额度
+    if (signal) {
+      if (signal.aborted) return finish('cooling', 'raced');
+      signal.addEventListener('abort', () => finish('cooling', 'raced'), { once: true });
+    }
     const send = o => { try { ws.send(JSON.stringify(o)); } catch {} };
     ws.addEventListener('open', () => {
       send({ type: 'cf_agent_stream_resume_request' });
@@ -241,18 +251,24 @@ function callCloudflare(c, messages, maxTokens, timeout) {
   });
 }
 
-async function callUpstream(c, messages, maxTokens, byokKey, timeout) {
+async function callUpstream(c, messages, maxTokens, byokKey, timeout, signal) {
   if (c.needsKey && !byokKey) return { kind: 'needs_key', why: '需要免费 Key' };
   if (channelOff[c.ch]) {
     if (Date.now() - channelOff[c.ch] < CHANNEL_COOL) return { kind: 'cooling', why: '通道冷却中：' + c.ch };
     delete channelOff[c.ch];   // 到点自动复活，重新进入无限轮转池
   }
-  if (c.kind === 'ws') return callCloudflare(c, messages, maxTokens, timeout || TIMEOUT);
+  if (c.kind === 'ws') return callCloudflare(c, messages, maxTokens, timeout || TIMEOUT, signal);
   const { url, headers, body } = buildRequest(c, messages, maxTokens, byokKey);
   const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), timeout || TIMEOUT);
+  const onAbort = () => ctl.abort();
+  if (signal) {
+    if (signal.aborted) ctl.abort();
+    else signal.addEventListener('abort', onAbort, { once: true });
+  }
   try {
     const r = await fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal: ctl.signal });
     clearTimeout(t);
+    if (signal) signal.removeEventListener('abort', onAbort);
     const txt = await r.text();
     const content = extractContent(txt);
     const placeholder = /^OK$/i.test((txt || '').trim());   // 上游被代理劫持成假 OK
@@ -263,6 +279,7 @@ async function callUpstream(c, messages, maxTokens, byokKey, timeout) {
     return { kind: 'ok', placeholder, data: native ? data : wrapOAI(c.id, content), content };
   } catch (e) {
     clearTimeout(t);
+    if (signal) signal.removeEventListener('abort', onAbort);
     return { kind: 'cooling', placeholder: false, why: String(e.message || e).slice(0, 60) };
   }
 }
@@ -343,11 +360,61 @@ function pickOrder(wantedId, keys) {
   }
   return order.slice(0, Math.min(order.length, 40));
 }
+// 跨渠道交错：让前 N 个槽位来自不同上游（并发竞速才有意义），也让 /v1/models 前十个
+// 不再是单一渠道全家桶 —— 第三方客户端常只取前 10 个当「可用模型示例」展示。
+function diversifyAll(order) {
+  const groups = new Map();
+  for (const s of order) {
+    const k = s.c ? s.c.provider : s.provider;
+    if (!groups.has(k)) groups.set(k, []);
+    groups.get(k).push(s);
+  }
+  const out = [];
+  while (out.length < order.length) {
+    let added = false;
+    for (const list of groups.values()) {
+      if (list.length) { out.push(list.shift()); added = true; }
+    }
+    if (!added) break;
+  }
+  return out;
+}
+// 竞速：一批 4 个不同渠道同时真调，谁先回话用谁，立刻中止其余上游省额度。
+// 全部失败才进入下一批；任何一批成功都不再等待慢槽位。
+async function raceOnce(batch, messages, maxTokens, timeout, headStartMs = 0) {
+  if (!batch.length || timeout < 1200) return null;
+  const ctrl = new AbortController();
+  let won = false;
+  const attempts = batch.map(async (slot, idx) => {
+    // 点名模型先独占一小段：能自己回话就精确命中，不回话再由其他旗舰接管（不傻等）
+    if (idx > 0 && headStartMs) {
+      await sleep(headStartMs);
+      if (ctrl.signal.aborted) throw new Error('raced');
+    }
+    const c = slot.c;
+    const r = await callUpstream(c, messages, maxTokens, slot.key, timeout, ctrl.signal);
+    if (r.kind === 'ok') {
+      if (won) throw new Error('raced');       // 已被别家抢先，丢弃本次结果
+      won = true;
+      ctrl.abort();                            // 中止其余 fetch / WebSocket
+      return { c, r };
+    }
+    if (!won) {
+      if (r.kind === 'dead') { c.dead = true; console.log('[abolish-live] ' + c.id); }
+      else c.lastFailWhy = r.why;
+    }
+    throw new Error(r.why || 'fail');
+  });
+  try { return await Promise.any(attempts); }
+  catch { ctrl.abort(); return null; }
+}
 function modelView(c) {
   return {
     id: c.id, object: 'model', owned_by: c.provider,
     tier: c.tier, display_name: c.label, params: c.params,
-    status: c.needsKey ? 'needs_key' : (c.lastOk > 0 ? 'ready' : 'cooling'),
+    // ready=真回过话；available=在轮转池里待命中、请求时会自动轮到（不是"不能用"）；
+    // 只有整条通道被熔断时才标 cooling；needs_key 需填免费 Key。真失效模型已废除、不再列入。
+    status: c.needsKey ? 'needs_key' : (c.lastOk > 0 ? 'ready' : (channelOff[c.ch] ? 'cooling' : 'available')),
     needs_key: c.needsKey, upstream: c.upstreamModel,
     context_length: c.ctx, capabilities: { tool_calling: true },
   };
@@ -366,7 +433,9 @@ const server = http.createServer(async (req, res) => {
       channels: [...new Set(alive().map(c => c.provider))],
       channelsOff: Object.keys(channelOff), githubToken: !!GH_TOKEN, lastTest: LAST_TEST,
       poolSlots: alive().length, flagshipSlots: alive().filter(c => c.tier === 'flagship').length,
-      rr: RR, channelCoolMs: CHANNEL_COOL, mode: 'unlimited-pool',
+      rr: RR, channelCoolMs: CHANNEL_COOL, mode: 'unlimited-pool-fast-race',
+      raceN: RACE_N, raceTimeoutMs: RACE_TIMEOUT, reqDeadlineMs: REQ_DEADLINE_MS,
+      available: alive().filter(c => !c.needsKey && !c.lastOk && !channelOff[c.ch]).length,
     });
 
   if (u.pathname === '/v1/selftest') {
@@ -384,7 +453,16 @@ const server = http.createServer(async (req, res) => {
 
   if (u.pathname === '/v1/models') {
     if (!confirmed().length && Date.now() - LAST_TEST > 20000) await selftest(false);
-    return jsonRes(res, 200, { object: 'list', data: alive().sort(byTier).map(modelView) });
+    const list = diversifyAll(alive().sort(byTier));
+    return jsonRes(res, 200, {
+      object: 'list',
+      total: list.length,
+      ready: confirmed().length,
+      channels: [...new Set(list.map(c => c.provider))],
+      note: '全部 ' + list.length + ' 个模型都在轮转池内可调用（第三方客户端若只显示前 10 个，那是它自己的"示例"截断）。'
+        + 'ready=已真回话验证；available=池内待命、请求时自动轮到并复活；needs_key=填免费 Key 解锁；cooling=该通道当前被熔断，30 秒自动恢复。真失效模型已废除不列入。',
+      data: list.map(modelView),
+    });
   }
 
   if (u.pathname === '/v1/chat/completions' && req.method === 'POST') {
@@ -403,37 +481,65 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    const order = pickOrder(body.model, keys);
-    const deadline = Date.now() + 80000;      // 单次请求最多遍历 80 秒，避免挂死
-    let lastWhy = 'unknown';
-    for (const slot of order) {
-      if (Date.now() > deadline) break;
-      const c = slot.c;
-      const r = await callUpstream(c, messages, maxTokens, slot.key, TIMEOUT);
-      if (r.kind === 'ok') {
-        c.lastOk = Date.now(); c.lastFailWhy = '';
-        const extra = { 'X-FreeAI-Model': c.id, 'X-FreeAI-Provider': c.provider };
-        if (body.stream) {
-          res.writeHead(200, { ...CORS, 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', ...extra });
-          const base = { id: 'chatcmpl-' + Date.now(), object: 'chat.completion.chunk', created: oaiNow(), model: body.model || c.id };
-          res.write('data: ' + JSON.stringify({ ...base, choices: [{ index: 0, delta: { role: 'assistant', content: r.content }, finish_reason: null }] }) + '\n\n');
-          res.write('data: ' + JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\n');
-          res.write('data: [DONE]\n\n'); res.end(); return;
-        }
-        return jsonRes(res, 200, r.data, extra);
-      }
-      lastWhy = r.why; c.lastFailWhy = r.why;
-      if (r.kind === 'dead') { c.dead = true; console.log('[abolish-live] ' + c.id); }
+    // 竞速候选：先在「旗舰档」里跨渠道挑，小模型只在旗舰全挂时才兜底 ——
+    // 避免最快的 20B 小模型抢答，把哥哥点名的 70B/120B 旗舰挤掉。
+    const raw = pickOrder(body.model, keys);
+    const offLast = arr => arr.slice().sort((a, b) => (channelOff[a.c.ch] ? 1 : 0) - (channelOff[b.c.ch] ? 1 : 0));
+    const flag = offLast(raw.filter(s => s.c.tier === 'flagship'));
+    const rest = offLast(raw.filter(s => s.c.tier !== 'flagship'));
+    const wantedSlot = body.model ? raw[0] : null;
+    const order = (wantedSlot && wantedSlot.c.tier !== 'flagship')
+      ? [wantedSlot, ...flag, ...rest.filter(s => s !== wantedSlot)]
+      : [...flag, ...rest];
+    const mixed = diversifyAll(order);
+    // 跨渠道交错保留，但把 pro/小模型整体推到旗舰之后：前几批竞速全是 70B+ 硬货
+    const raced = [
+      ...mixed.filter(s => s.c.tier === 'flagship' || s === wantedSlot),
+      ...mixed.filter(s => s.c.tier !== 'flagship' && s !== wantedSlot),
+    ];
+    const stream = !!body.stream;
+    // 流式：立刻吐 SSE 头 + 首包，让聊天客户端的 spinner 马上停、进入接收状态，
+    // 不再干等网关把几十个槽位串行试完（那正是「转几分钟」的根因）。
+    if (stream) {
+      res.writeHead(200, { ...CORS, 'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+      res.write(': freeai-proxy racing ' + RACE_N + ' channels...\n\n');
     }
-    return jsonRes(res, 429, {
-      error: { message: '所有可用通道此刻均限流，请稍等约 30-45 秒再试。最后错误：' + lastWhy, type: 'rate_limited', code: 'upstream_busy' },
-    }, { 'Retry-After': '30' });
+    const deadline = Date.now() + REQ_DEADLINE_MS;
+    let lastWhy = 'unknown', winner = null;
+    const maxSlots = RACE_N * RACE_BATCHES;
+    for (let i = 0; i < Math.min(raced.length, maxSlots) && !winner && Date.now() < deadline; i += RACE_N) {
+      const batch = raced.slice(i, i + RACE_N);
+      winner = await raceOnce(batch, messages, maxTokens, Math.min(RACE_TIMEOUT, deadline - Date.now()),
+        i === 0 && body.model ? 2000 : 0);
+      if (!winner) lastWhy = '一批 ' + batch.length + ' 家渠道均限流/超时';
+    }
+    if (!winner) {
+      if (stream) {
+        res.write('data: ' + JSON.stringify({ error: { message: '所有渠道此刻均限流，稍等约 20 秒再试。' + lastWhy, type: 'rate_limited', code: 'upstream_busy' } }) + '\n\n');
+        res.write('data: [DONE]\n\n'); res.end(); return;
+      }
+      return jsonRes(res, 429, {
+        error: { message: '所有可用通道此刻均限流，请稍等约 20 秒再试。最后错误：' + lastWhy, type: 'rate_limited', code: 'upstream_busy' },
+      }, { 'Retry-After': '20' });
+    }
+    const { c, r } = winner;
+    c.lastOk = Date.now(); c.lastFailWhy = '';
+    const extra = { 'X-FreeAI-Model': c.id, 'X-FreeAI-Provider': c.provider };
+    if (stream) {
+      const base = { id: 'chatcmpl-' + Date.now(), object: 'chat.completion.chunk', created: oaiNow(), model: c.id };
+      res.write(': served-by ' + c.provider + ' / ' + c.id + '\n\n');
+      res.write('data: ' + JSON.stringify({ ...base, choices: [{ index: 0, delta: { role: 'assistant', content: r.content }, finish_reason: null }] }) + '\n\n');
+      res.write('data: ' + JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\n');
+      res.write('data: [DONE]\n\n'); res.end(); return;
+    }
+    return jsonRes(res, 200, r.data, extra);
   }
 
   jsonRes(res, 200, {
-    name: 'freeai-proxy', version: '3.0-unlimited-pool', alive: alive().length, confirmed: confirmed().length,
+    name: 'freeai-proxy', version: '4.0-fast-race', alive: alive().length, confirmed: confirmed().length,
     poolSlots: alive().length, flagship: alive().filter(c => c.tier === 'flagship').length,
-    mode: '全局轮转 + 限流自动跳 + 30s 自动复活 + Key 池线性扩容',
+    mode: '跨渠道并发竞速(谁快用谁) + 流式秒首包 + 全局轮转 + 限流自动跳 + 30s 自动复活 + Key 池线性扩容',
     channels: [...new Set(POOL.map(c => c.provider))],
     endpoints: ['/healthz', '/v1/models', '/v1/chat/completions', '/v1/selftest'],
   });
