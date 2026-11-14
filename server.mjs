@@ -1,4 +1,5 @@
 import http from 'node:http';
+import crypto from 'node:crypto';
 
 const PORT = Number(process.env.PORT || 10000);
 const TIMEOUT = Number(process.env.UPSTREAM_TIMEOUT || 12000);
@@ -21,6 +22,8 @@ const CH = {
   gh:     { label: 'github-models', kind: 'oai',     endpoint: 'https://models.github.ai/inference/chat/completions', auth: 'env' },
   or:     { label: 'openrouter',    kind: 'oai',     endpoint: 'https://openrouter.ai/api/v1/chat/completions',      auth: 'byok' },
   af:     { label: 'api-airforce',  kind: 'oai',     endpoint: 'https://api.airforce/v1/chat/completions',          auth: 'byok' },
+  cf:     { label: 'cloudflare',    kind: 'ws',      endpoint: 'wss://playground.ai.cloudflare.com' },
+  llm7:   { label: 'llm7',          kind: 'oai',     endpoint: 'https://api.llm7.io/v1/chat/completions' },
 };
 
 // tier: flagship(旗舰/超大杯) > pro(标准) > light(轻量)
@@ -57,6 +60,32 @@ const DEFS = [
   { id: 'deepseek-reasoning', ch: 'poll',  up: 'deepseek-reasoning',                     tier: 'pro',      label: 'DeepSeek 推理',     params: '匿名额度恢复后可用',    ctx: 128000, core: 0 },
   { id: 'gemini',             ch: 'poll',  up: 'gemini',                                 tier: 'pro',      label: 'Gemini',            params: '匿名额度恢复后可用',    ctx: 128000, core: 0 },
   { id: 'claude',             ch: 'poll',  up: 'claude',                                 tier: 'pro',      label: 'Claude',            params: '匿名额度恢复后可用',    ctx: 128000, core: 0 },
+
+  // ── Cloudflare Workers AI：51 个零凭证模型，WebSocket 独立会话，每请求新建 agent 天然摊额度 ──
+  { id: 'cf/gpt-oss-120b',    ch: 'cf', up: '@cf/openai/gpt-oss-120b',                        tier: 'flagship', label: 'GPT-OSS 120B',       params: '120B · CF 免Key',   ctx: 128000, core: 1 },
+  { id: 'cf/llama-3.3-70b',   ch: 'cf', up: '@cf/meta/llama-3.3-70b-instruct-fp8-fast',      tier: 'flagship', label: 'Llama 3.3 70B',      params: '70B · CF 免Key',    ctx: 128000, core: 1 },
+  { id: 'cf/nemotron-3-120b', ch: 'cf', up: '@cf/nvidia/nemotron-3-120b-a12b',               tier: 'flagship', label: 'Nemotron 3 120B',    params: '120B MoE · CF 免Key',ctx: 128000, core: 0 },
+  { id: 'cf/kimi-k2.7-code',  ch: 'cf', up: '@cf/moonshotai/kimi-k2.7-code',                 tier: 'flagship', label: 'Kimi K2.7 Code',     params: 'MoE · CF 免Key',    ctx: 128000, core: 0 },
+  { id: 'cf/kimi-k2.6',       ch: 'cf', up: '@cf/moonshotai/kimi-k2.6',                      tier: 'flagship', label: 'Kimi K2.6',          params: 'MoE · CF 免Key',    ctx: 128000, core: 0 },
+  { id: 'cf/glm-5.2',         ch: 'cf', up: '@cf/zai-org/glm-5.2',                           tier: 'flagship', label: 'GLM-5.2',            params: '智谱旗舰 · CF 免Key',ctx: 200000, core: 0 },
+  { id: 'cf/glm-4.7-flash',   ch: 'cf', up: '@cf/zai-org/glm-4.7-flash',                     tier: 'flagship', label: 'GLM-4.7 Flash',      params: 'MoE · CF 免Key',    ctx: 128000, core: 0 },
+  { id: 'cf/llama-4-scout',   ch: 'cf', up: '@cf/meta/llama-4-scout-17b-16e-instruct',       tier: 'flagship', label: 'Llama 4 Scout',      params: '109B MoE · CF 免Key',ctx: 128000, core: 0 },
+  { id: 'cf/qwen3-30b',       ch: 'cf', up: '@cf/qwen/qwen3-30b-a3b-fp8',                    tier: 'flagship', label: 'Qwen3 30B A3B',      params: '30B MoE · CF 免Key',ctx: 128000, core: 0 },
+  { id: 'cf/qwen2.5-coder32', ch: 'cf', up: '@cf/qwen/qwen2.5-coder-32b-instruct',           tier: 'flagship', label: 'Qwen2.5 Coder 32B',  params: '32B 代码 · CF 免Key',ctx: 32000,  core: 0 },
+  { id: 'cf/qwq-32b',         ch: 'cf', up: '@cf/qwen/qwq-32b',                              tier: 'flagship', label: 'QwQ 32B',            params: '32B 推理 · CF 免Key',ctx: 32000,  core: 0 },
+  { id: 'cf/deepseek-r1-32b', ch: 'cf', up: '@cf/deepseek-ai/deepseek-r1-distill-qwen-32b',  tier: 'flagship', label: 'DeepSeek R1 32B',    params: '32B 推理 · CF 免Key',ctx: 32000,  core: 0 },
+  { id: 'cf/mistral-small24', ch: 'cf', up: '@cf/mistralai/mistral-small-3.1-24b-instruct',  tier: 'pro',      label: 'Mistral Small 24B',  params: '24B · CF 免Key',    ctx: 32000,  core: 0 },
+  { id: 'cf/gemma-4-26b',     ch: 'cf', up: '@cf/google/gemma-4-26b-a4b-it',                 tier: 'pro',      label: 'Gemma 4 26B',        params: '26B MoE · CF 免Key',ctx: 32000,  core: 0 },
+  { id: 'cf/gpt-oss-20b',     ch: 'cf', up: '@cf/openai/gpt-oss-20b',                        tier: 'pro',      label: 'GPT-OSS 20B',        params: '20B · CF 免Key',    ctx: 128000, core: 0 },
+  { id: 'cf/gemma-3-12b',     ch: 'cf', up: '@cf/google/gemma-3-12b-it',                     tier: 'pro',      label: 'Gemma 3 12B',        params: '12B · CF 免Key',    ctx: 32000,  core: 0 },
+
+  // ── LLM7.io：turbo 档零凭证，OpenAI 兼容 ──
+  { id: 'llm7/deepseek-v4',   ch: 'llm7', up: 'DeepSeek-V4-Flash-0731',                     tier: 'flagship', label: 'DeepSeek V4 Flash',  params: 'LLM7 免Key',        ctx: 64000, core: 1 },
+  { id: 'llm7/glm-5.3-flash', ch: 'llm7', up: 'GLM-5.3-Flash',                             tier: 'flagship', label: 'GLM-5.3 Flash',      params: 'LLM7 免Key',        ctx: 64000, core: 0 },
+  { id: 'llm7/codestral',     ch: 'llm7', up: 'codestral-latest',                           tier: 'pro',      label: 'Codestral',          params: '代码 · LLM7 免Key', ctx: 32000, core: 0 },
+  { id: 'llm7/gpt-oss-20b',   ch: 'llm7', up: 'gpt-oss:20b',                               tier: 'pro',      label: 'GPT-OSS 20B',        params: 'LLM7 免Key',        ctx: 32000, core: 0 },
+  { id: 'llm7/minimax-m2.7',  ch: 'llm7', up: 'minimax-m2.7',                               tier: 'flagship', label: 'MiniMax M2.7',       params: 'LLM7 免Key',        ctx: 64000, core: 0 },
+  { id: 'llm7/mistral-nemo',  ch: 'llm7', up: 'mistral-Nemo-Instruct-2407',                 tier: 'pro',      label: 'Mistral Nemo',       params: 'LLM7 免Key',        ctx: 32000, core: 0 },
 
   // ── BYOK 旗舰档：填一个免费注册的 Key（OpenRouter / api.airforce，均无需绑卡）即解锁 ──
   { id: 'or/claude-sonnet-4.5', ch: 'or', up: 'anthropic/claude-sonnet-4.5',           tier: 'flagship', label: 'Claude Sonnet 4.5', params: 'Anthropic 旗舰',        ctx: 200000, needsKey: 1 },
@@ -164,12 +193,61 @@ function classify(status, txt, content) {
   if (!content) return 'cooling';
   return 'ok';
 }
+// Cloudflare Workers AI Playground：零凭证 WebSocket，每次新建独立 agent（天然摊额度）
+function callCloudflare(c, messages, maxTokens, timeout) {
+  return new Promise(resolve => {
+    const agentId = 'playground-' + Math.random().toString(36).substring(2, 15);
+    const pk = crypto.randomUUID();
+    const model = c.upstreamModel;
+    const url = 'wss://playground.ai.cloudflare.com/agents/playground/' + agentId
+      + '?_pk=' + pk + '&model=' + encodeURIComponent(model);
+    let ws, done = false, out = '', idle;
+    const finish = (kind, why) => {
+      if (done) return; done = true;
+      clearTimeout(timer); clearTimeout(idle);
+      try { ws && ws.close(); } catch {}
+      resolve(kind === 'ok'
+        ? { kind: 'ok', placeholder: false, data: wrapOAI(c.id, out.trim()), content: out.trim() }
+        : { kind, placeholder: false, why });
+    };
+    const timer = setTimeout(() => finish(out.trim() ? 'ok' : 'cooling', 'ws timeout'), timeout || 14000);
+    try { ws = new WebSocket(url); } catch (e) { return finish('cooling', String(e)); }
+    const send = o => { try { ws.send(JSON.stringify(o)); } catch {} };
+    ws.addEventListener('open', () => {
+      send({ type: 'cf_agent_stream_resume_request' });
+      send({ name: agentId, agent: 'playground', type: 'cf_agent_identity' });
+      send({ state: { model, temperature: 1, stream: true, system: 'You are a helpful assistant.', useExternalProvider: false, externalProvider: 'openai', generativeUI: false }, type: 'cf_agent_state' });
+      send({ mcp: { prompts: [], resources: [], servers: {}, tools: [] }, type: 'cf_agent_mcp_servers' });
+      send({ type: 'cf_agent_stream_resume_none' });
+      setTimeout(() => {
+        const cfMessages = messages.map((m, i) => ({ role: m.role, parts: [{ type: 'text', text: String(m.content) }], id: 'msg_' + i }));
+        send({ id: 'req_' + Math.random().toString(36).substring(2, 10), init: { method: 'POST', body: JSON.stringify({ messages: cfMessages, trigger: 'submit-message' }) }, type: 'cf_agent_use_chat_request' });
+      }, 900);
+    });
+    ws.addEventListener('message', ev => {
+      let d; try { d = JSON.parse(String(ev.data)); } catch { return; }
+      if (d.type !== 'cf_agent_use_chat_response') return;
+      let b; try { b = JSON.parse(d.body || '{}'); } catch { return; }
+      if (b.type === 'text-delta' && typeof b.delta === 'string') {
+        out += b.delta;
+        clearTimeout(idle);
+        idle = setTimeout(() => finish(out.trim() ? 'ok' : 'cooling', 'ws idle done'), 1200);
+      }
+      if (d.done === true || b.type === 'finish-step' || b.type === 'finish' || b.type === 'text-end')
+        finish(out.trim() ? 'ok' : 'cooling', 'ws done');
+    });
+    ws.addEventListener('error', () => finish('cooling', 'ws error'));
+    ws.addEventListener('close', () => finish(out.trim() ? 'ok' : 'cooling', 'ws closed'));
+  });
+}
+
 async function callUpstream(c, messages, maxTokens, byokKey, timeout) {
   if (c.needsKey && !byokKey) return { kind: 'needs_key', why: '需要免费 Key' };
   if (channelOff[c.ch]) {
     if (Date.now() - channelOff[c.ch] < CHANNEL_COOL) return { kind: 'cooling', why: '通道冷却中：' + c.ch };
     delete channelOff[c.ch];   // 到点自动复活，重新进入无限轮转池
   }
+  if (c.kind === 'ws') return callCloudflare(c, messages, maxTokens, timeout || TIMEOUT);
   const { url, headers, body } = buildRequest(c, messages, maxTokens, byokKey);
   const ctl = new AbortController(); const t = setTimeout(() => ctl.abort(), timeout || TIMEOUT);
   try {
@@ -256,7 +334,12 @@ function pickOrder(wantedId, keys) {
   let order = rotated;
   if (wantedId) {
     const w = rotated.find(s => s.id === wantedId);
-    if (w) order = [w, ...rotated.filter(s => s !== w)];   // 指定模型优先，但失败后仍全池兜底
+    if (w) {
+      // 指定模型失败时，先在同一家渠道内换模型，再跨渠道兜底，尽量不「降级」到别家小模型
+      const sameCh = rotated.filter(s => s !== w && s.c.ch === w.c.ch);
+      const otherCh = rotated.filter(s => s !== w && s.c.ch !== w.c.ch);
+      order = [w, ...sameCh, ...otherCh];
+    }
   }
   return order.slice(0, Math.min(order.length, 40));
 }
