@@ -7,14 +7,16 @@ const GH_TOKEN = process.env.GITHUB_PAT || '';
 // ── 低延迟竞速：一次请求同时打多家不同渠道，谁先真回话就用谁；绝不串行挨个等超时 ──
 const RACE_TIMEOUT = Number(process.env.RACE_TIMEOUT || 7000);       // 竞速单槽位最多 7 秒
 const RACE_N = 4;                                                     // 每批 4 个不同渠道并发
-const RACE_BATCHES = 3;                                               // 最多 3 批兜底
-const REQ_DEADLINE_MS = Number(process.env.REQ_DEADLINE_MS || 17000); // 单次请求硬上限 17 秒
+const RACE_BATCHES = 2;                                               // 最多 2 批兜底，避免拖到客户端超时
+const REQ_DEADLINE_MS = Number(process.env.REQ_DEADLINE_MS || 14000); // 单次请求硬上限 14 秒
 
+// 放宽 CORS：第三方套壳 App 常带自定义头（X-Title / HTTP-Referer / x-stainless-* 等），
+// 预检被拒会直接 fetch reject，客户端把错误对象 String() 就显示成 [object Object]。
 const CORS = {
   'Access-Control-Allow-Origin': '*',
-  'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-  'Access-Control-Allow-Headers': 'Authorization,Content-Type,X-Upstream-Key',
-  'Access-Control-Expose-Headers': 'X-FreeAI-Model,X-FreeAI-Provider',
+  'Access-Control-Allow-Methods': 'GET,POST,OPTIONS,HEAD',
+  'Access-Control-Allow-Headers': '*',
+  'Access-Control-Expose-Headers': '*',
   'Access-Control-Max-Age': '86400',
 };
 
@@ -136,13 +138,41 @@ function readBody(req) {
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
+// 把任何值强制收敛成「纯字符串」：上游偶尔给对象/数组/多模态 content，
+// 直接 String() 会变成 "[object Object]" —— 这正是套壳 App 显示 ❌[object Object] 的根因之一。
+function asText(v) {
+  if (v == null) return '';
+  if (typeof v === 'string') return v;
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v);
+  if (Array.isArray(v)) return v.map(x => asText(x && typeof x === 'object' ? (x.text ?? x.content ?? '') : x)).filter(Boolean).join('');
+  if (typeof v === 'object') {
+    for (const k of ['text', 'content', 'value', 'answer', 'output', 'response', 'message']) {
+      if (v[k] != null) { const s = asText(v[k]); if (s) return s; }
+    }
+    return '';   // 宁可空，也绝不吐出 [object Object]
+  }
+  return String(v);
+}
 function wrapOAI(model, content) {
   return {
     id: 'chatcmpl-' + Date.now(), object: 'chat.completion', created: oaiNow(), model,
-    choices: [{ index: 0, message: { role: 'assistant', content }, finish_reason: 'stop' }],
+    choices: [{ index: 0, message: { role: 'assistant', content: asText(content) }, finish_reason: 'stop' }],
     usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
   };
 }
+// 标准 OpenAI 流式 chunk：delta 与 message 都放同一份字符串，
+// 兼容读 delta.content 与读 message.content 的两类套壳客户端；绝不含注释行 / 裸 error 帧。
+function oaiChunk(id, model, content, finish) {
+  const text = asText(content);
+  const choice = { index: 0, finish_reason: finish ? 'stop' : null };
+  if (finish) { choice.delta = { content: '' }; choice.message = { role: 'assistant', content: '' }; }
+  else {
+    choice.delta = { role: 'assistant', content: text };
+    choice.message = { role: 'assistant', content: text };
+  }
+  return { id, object: 'chat.completion.chunk', created: oaiNow(), model, choices: [choice] };
+}
+function sse(res, obj) { res.write('data: ' + JSON.stringify(obj) + '\n\n'); }
 const COOLING = /FREE_LIMIT|free_limit|rate.?limit|429|402|quota|too many|try again|premium|Authentication required|Just a moment|CAPTCHA/i;
 const DEADTXT = /NOT_FOUND|Model not found|model not found|invalid.?model|unknown model|Selected model is required|Invalid session|missing query/i;
 function extractContent(txt) {
@@ -152,13 +182,13 @@ function extractContent(txt) {
   if (typeof d === 'string') return /^OK$/i.test(d.trim()) || COOLING.test(d) ? '' : d.trim();
   if (Array.isArray(d) || !d || typeof d !== 'object') return '';
   let c = '';
-  if (d.choices) c = String(d.choices[0]?.message?.content ?? d.choices[0]?.text ?? '').trim();
+  if (d.choices) c = asText(d.choices[0]?.message?.content ?? d.choices[0]?.delta?.content ?? d.choices[0]?.text ?? '').trim();
   if (!c && typeof d.data === 'string') c = d.data.trim();
-  if (!c && d.data && typeof d.data === 'object') c = String(d.data.content ?? d.data.text ?? '').trim();
+  if (!c && d.data && typeof d.data === 'object') c = asText(d.data.content ?? d.data.text ?? '').trim();
   if (!c) for (const k of ['content', 'response', 'text', 'answer', 'result', 'output', 'completion', 'message']) {
     if (typeof d[k] === 'string' && d[k].trim()) { c = d[k].trim(); break; }
   }
-  if (!c && d.error) c = String(d.error.message || d.error.code || '');
+  if (!c && d.error) c = asText(d.error.message || d.error.code || '');
   return (COOLING.test(c) || /^OK$/i.test(c)) ? '' : c;
 }
 function toQuery(messages) {
@@ -274,9 +304,8 @@ async function callUpstream(c, messages, maxTokens, byokKey, timeout, signal) {
     const placeholder = /^OK$/i.test((txt || '').trim());   // 上游被代理劫持成假 OK
     const kind = r.ok ? classify(200, txt, content) : classify(r.status, txt, content);
     if (kind !== 'ok') return { kind, placeholder, why: 'HTTP ' + r.status + ' ' + String(txt).slice(0, 70) };
-    let data; try { data = JSON.parse(txt); } catch { data = null; }
-    const native = data && data.choices && data.choices[0];
-    return { kind: 'ok', placeholder, data: native ? data : wrapOAI(c.id, content), content };
+    // 不再原样透传上游 JSON：上游的 content/字段形态不可控，一律重包成干净的纯字符串结构
+    return { kind: 'ok', placeholder, data: wrapOAI(c.id, content), content: asText(content) };
   } catch (e) {
     clearTimeout(t);
     if (signal) signal.removeEventListener('abort', onAbort);
@@ -421,8 +450,26 @@ function modelView(c) {
 }
 
 const server = http.createServer(async (req, res) => {
+  // 统一回显跨域来源：套壳 App 若用 credentials 模式，通配符 Origin 会被浏览器拒绝
+  const origin = req.headers.origin;
+  const rawWriteHead = res.writeHead.bind(res);
+  res.writeHead = function (code, headers) {
+    const h = { ...(headers || {}) };
+    if (origin) {
+      h['Access-Control-Allow-Origin'] = origin;
+      h['Access-Control-Allow-Credentials'] = 'true';
+      h['Vary'] = 'Origin';
+    }
+    return rawWriteHead(code, h);
+  };
   let u; try { u = new URL(req.url, 'http://x'); } catch { return jsonRes(res, 400, { error: 'bad url' }); }
-  if (req.method === 'OPTIONS') { res.writeHead(204, CORS); res.end(); return; }
+  if (req.method === 'OPTIONS') {
+    // 动态回显预检请求头，避免某些浏览器/套壳因通配符不生效而 fetch reject
+    const pre = { ...CORS };
+    const asked = req.headers['access-control-request-headers'];
+    if (asked) pre['Access-Control-Allow-Headers'] = asked;
+    res.writeHead(204, pre); res.end(); return;
+  }
 
   if (u.pathname === '/healthz')
     return jsonRes(res, 200, {
@@ -465,75 +512,82 @@ const server = http.createServer(async (req, res) => {
     });
   }
 
-  if (u.pathname === '/v1/chat/completions' && req.method === 'POST') {
+  // 路径兼容：/v1/chat/completions、/chat/completions、/v1/v1/chat/completions、尾斜杠
+  const chatPath = /^\/(?:v1\/)*chat\/completions?\/?$/i.test(u.pathname);
+  if (chatPath && req.method === 'POST') {
     // 免费档永远不校验 Key；Key 池（多个免费 Key 用逗号/换行分隔）让 BYOK 档线性扩容
     const keys = String(req.headers['x-upstream-key'] || '').split(/[\s,;]+/).map(s => s.trim()).filter(Boolean);
     const body = await readBody(req);
-    const messages = body.messages || [{ role: 'user', content: 'hi' }];
+    // 第三方 App 常塞超长 system prompt / 搜索结果 / 多模态 content 数组 —— 一律收敛成纯文本，
+    // 否则上游拿到对象会回奇怪结构，客户端又渲染成 [object Object]。
+    const messages = (Array.isArray(body.messages) && body.messages.length ? body.messages : [{ role: 'user', content: 'hi' }])
+      .map(m => ({ role: String(m?.role || 'user'), content: asText(m?.content) }))
+      .filter(m => m.content);
+    if (!messages.length) messages.push({ role: 'user', content: 'hi' });
     const maxTokens = body.max_tokens || 512;
-    const wanted = POOL.find(c => c.id === body.model);
+    // stream 可能是 true / 1 / "true"（字符串 "false" 绝不能误判成流式）
+    const stream = body.stream === true || body.stream === 1 || body.stream === 'true';
+    const reqModel = String(body.model || '');
+    const cid = 'chatcmpl-' + Date.now();
+
+    // 统一的「流式收尾」：只发标准 chunk + [DONE]，绝不发注释行 / 裸 error 帧。
+    // 很多套壳 App 对每一行都 JSON.parse，任何非 chunk 帧都会让它 catch 出 ❌[object Object]。
+    const streamFinish = (model, text, isError) => {
+      sse(res, oaiChunk(cid, model, '', false));              // role 帧
+      if (text) sse(res, oaiChunk(cid, model, asText(text), false));  // 内容帧
+      sse(res, oaiChunk(cid, model, '', true));                // finish 帧
+      res.write('data: [DONE]\n\n'); res.end();
+    };
+    const openStream = () => {
+      res.writeHead(200, { ...CORS, 'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
+      if (res.flushHeaders) res.flushHeaders();
+      sse(res, oaiChunk(cid, reqModel || 'freeai-proxy', '', false));  // 立刻吐合法首帧，spinner 马上停
+    };
+
+    const wanted = POOL.find(c => c.id === reqModel);
     if (wanted && wanted.needsKey && !keys.length && !wanted.dead) {
-      return jsonRes(res, 402, {
-        error: {
-          message: '「' + wanted.label + '」属于高级 BYOK 档：请在控制台填入免费 Key（OpenRouter 或 api.airforce 免费注册，无需绑卡），请求头 X-Upstream-Key 可填多个，网关会自动轮转摊额度。不带 Key 的免费模型现在就能直接调用。',
-          type: 'needs_key', code: 'upstream_key_required', model: wanted.id,
-        },
-      });
+      const msg = '「' + wanted.label + '」属于高级 BYOK 档：请在控制台填入免费 Key（OpenRouter / api.airforce 免费注册，无需绑卡），请求头 X-Upstream-Key。不填 Key 的话，选 /v1/models 里不带「需 Key」的模型即可直接调用。';
+      if (stream) { openStream(); return streamFinish(reqModel, msg, true); }
+      return jsonRes(res, 402, { error: { message: msg, type: 'needs_key', code: 'upstream_key_required', model: wanted.id } });
     }
 
-    // 竞速候选：先在「旗舰档」里跨渠道挑，小模型只在旗舰全挂时才兜底 ——
-    // 避免最快的 20B 小模型抢答，把哥哥点名的 70B/120B 旗舰挤掉。
-    const raw = pickOrder(body.model, keys);
+    // 竞速候选：先在「旗舰档」里跨渠道挑，小模型只在旗舰全挂时才兜底
+    const raw = pickOrder(reqModel, keys);
     const offLast = arr => arr.slice().sort((a, b) => (channelOff[a.c.ch] ? 1 : 0) - (channelOff[b.c.ch] ? 1 : 0));
     const flag = offLast(raw.filter(s => s.c.tier === 'flagship'));
     const rest = offLast(raw.filter(s => s.c.tier !== 'flagship'));
-    const wantedSlot = body.model ? raw[0] : null;
+    const wantedSlot = reqModel ? raw[0] : null;
     const order = (wantedSlot && wantedSlot.c.tier !== 'flagship')
       ? [wantedSlot, ...flag, ...rest.filter(s => s !== wantedSlot)]
       : [...flag, ...rest];
     const mixed = diversifyAll(order);
-    // 跨渠道交错保留，但把 pro/小模型整体推到旗舰之后：前几批竞速全是 70B+ 硬货
     const raced = [
       ...mixed.filter(s => s.c.tier === 'flagship' || s === wantedSlot),
       ...mixed.filter(s => s.c.tier !== 'flagship' && s !== wantedSlot),
     ];
-    const stream = !!body.stream;
-    // 流式：立刻吐 SSE 头 + 首包，让聊天客户端的 spinner 马上停、进入接收状态，
-    // 不再干等网关把几十个槽位串行试完（那正是「转几分钟」的根因）。
-    if (stream) {
-      res.writeHead(200, { ...CORS, 'Content-Type': 'text/event-stream; charset=utf-8',
-        'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
-      res.write(': freeai-proxy racing ' + RACE_N + ' channels...\n\n');
-    }
+    if (stream) openStream();
     const deadline = Date.now() + REQ_DEADLINE_MS;
     let lastWhy = 'unknown', winner = null;
     const maxSlots = RACE_N * RACE_BATCHES;
     for (let i = 0; i < Math.min(raced.length, maxSlots) && !winner && Date.now() < deadline; i += RACE_N) {
       const batch = raced.slice(i, i + RACE_N);
       winner = await raceOnce(batch, messages, maxTokens, Math.min(RACE_TIMEOUT, deadline - Date.now()),
-        i === 0 && body.model ? 2000 : 0);
+        i === 0 && reqModel ? 2000 : 0);
       if (!winner) lastWhy = '一批 ' + batch.length + ' 家渠道均限流/超时';
     }
     if (!winner) {
-      if (stream) {
-        res.write('data: ' + JSON.stringify({ error: { message: '所有渠道此刻均限流，稍等约 20 秒再试。' + lastWhy, type: 'rate_limited', code: 'upstream_busy' } }) + '\n\n');
-        res.write('data: [DONE]\n\n'); res.end(); return;
-      }
-      return jsonRes(res, 429, {
-        error: { message: '所有可用通道此刻均限流，请稍等约 20 秒再试。最后错误：' + lastWhy, type: 'rate_limited', code: 'upstream_busy' },
-      }, { 'Retry-After': '20' });
+      // 关键：失败也返回标准 chunk（HTTP 200 + 纯字符串提示），不让客户端 catch 出 [object Object]
+      const msg = '【网关提示】当前所有上游渠道都在忙（' + lastWhy + '），请稍等约 20 秒后点「重新生成」再发一次。免费公益额度会波动，多试一次通常就好了。';
+      if (stream) return streamFinish(reqModel || 'freeai-proxy', msg, true);
+      return jsonRes(res, 200, wrapOAI(reqModel || 'freeai-proxy', msg), { 'X-FreeAI-Status': 'upstream_busy' });
     }
     const { c, r } = winner;
     c.lastOk = Date.now(); c.lastFailWhy = '';
-    const extra = { 'X-FreeAI-Model': c.id, 'X-FreeAI-Provider': c.provider };
-    if (stream) {
-      const base = { id: 'chatcmpl-' + Date.now(), object: 'chat.completion.chunk', created: oaiNow(), model: c.id };
-      res.write(': served-by ' + c.provider + ' / ' + c.id + '\n\n');
-      res.write('data: ' + JSON.stringify({ ...base, choices: [{ index: 0, delta: { role: 'assistant', content: r.content }, finish_reason: null }] }) + '\n\n');
-      res.write('data: ' + JSON.stringify({ ...base, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }) + '\n\n');
-      res.write('data: [DONE]\n\n'); res.end(); return;
-    }
-    return jsonRes(res, 200, r.data, extra);
+    const model = reqModel || c.id;
+    const text = asText(r.content);
+    if (stream) return streamFinish(model, text, false);
+    return jsonRes(res, 200, wrapOAI(model, text), { 'X-FreeAI-Model': c.id, 'X-FreeAI-Provider': c.provider });
   }
 
   jsonRes(res, 200, {
